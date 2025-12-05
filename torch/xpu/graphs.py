@@ -21,18 +21,18 @@ __all__ = [
 if not hasattr(torch._C, "_XpuStreamBase"):
     # Define dummy base classes
     torch._C.__dict__["_XPUGraph"] = _dummy_type("_XPUGraph")
-    torch._C.__dict__["_graph_pool_handle"] = _dummy_type("_graph_pool_handle")
+    torch._C.__dict__["_xpu_graph_pool_handle"] = _dummy_type("_xpu_graph_pool_handle")
 
 from torch._C import (  # noqa: F401
     _XPUGraph,
-    _graph_pool_handle,
+    _xpu_graph_pool_handle,
 )
 
 def graph_pool_handle() -> _POOL_HANDLE:
     r"""Return an opaque token representing the id of a graph memory pool.
 
     """
-    return torch.xpu._POOL_HANDLE(_graph_pool_handle())
+    return torch.xpu._POOL_HANDLE(_xpu_graph_pool_handle())
 
 class XPUGraph(torch._C._XPUGraph):
     r"""Wrapper around a XPU graph.
@@ -94,6 +94,14 @@ class XPUGraph(torch._C._XPUGraph):
     def reset(self) -> None:
         r"""Delete the graph currently held by this instance."""
         super().reset()
+
+    def pool(self) -> _POOL_HANDLE:
+        r"""Return an opaque token representing the id of this graph's memory pool.
+
+        This id can optionally be passed to another graph's ``capture_begin``,
+        which hints the other graph may share the same memory pool.
+        """
+        return super().pool()
 
 class graph:
     r"""Context-manager that captures XPU work into a :class:`torch.xpu.XPUGraph` object for later replay.

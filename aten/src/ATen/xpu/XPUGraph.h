@@ -33,6 +33,7 @@ struct TORCH_XPU_API XPUGraph {
   void instantiate();
   void replay();
   void reset();
+  MempoolId_t pool();
 
  protected:
   std::unique_ptr<xpuGraph_t> graph_;

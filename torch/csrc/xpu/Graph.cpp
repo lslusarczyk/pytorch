@@ -17,7 +17,7 @@ void THXPGraph_init(PyObject* module) {
   // but CI linter and some builds prefer "module".
   auto torch_C_m = py::handle(module).cast<py::module>();
 
-  torch_C_m.def("_graph_pool_handle", &::at::xpu::graph_pool_handle);
+  torch_C_m.def("_xpu_graph_pool_handle", &::at::xpu::graph_pool_handle);
 
   shared_ptr_class_<::at::xpu::XPUGraph>(torch_C_m, "_XPUGraph")
       .def(py::init<bool>(), py::arg("keep_graph") = false)
@@ -39,9 +39,22 @@ void THXPGraph_init(PyObject* module) {
           "instantiate",
           torch::wrap_pybind_function_no_gil(&at::xpu::XPUGraph::instantiate))
       .def(
+          "register_generator_state",
+          [](::at::xpu::XPUGraph& self, py::handle raw_generator) {
+            auto generator = THPGenerator_Unwrap(raw_generator.ptr());
+            // We've unwrapped Python object to C++ object,
+            // so we could release GIL before calling into C++
+            py::gil_scoped_release release;
+            return self.register_generator_state(generator);
+          },
+          py::arg("generator"))
+      .def(
           "replay",
           torch::wrap_pybind_function_no_gil(&at::xpu::XPUGraph::replay))
       .def(
           "reset",
-          torch::wrap_pybind_function_no_gil(&at::xpu::XPUGraph::reset));
+          torch::wrap_pybind_function_no_gil(&at::xpu::XPUGraph::reset))
+      .def(
+          "pool",
+          torch::wrap_pybind_function_no_gil(&at::xpu::XPUGraph::pool));
 }

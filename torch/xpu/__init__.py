@@ -19,7 +19,7 @@ from torch._utils import _dummy_type, _LazySeedTracker
 from torch.types import Device
 
 from ._utils import _get_device_index
-from .graphs import graph, XPUGraph
+from .graphs import graph, XPUGraph, graph_pool_handle
 from .streams import Event, Stream
 
 
@@ -575,6 +575,7 @@ __all__ = [
     "get_rng_state_all",
     "get_stream_from_external",
     "graph",
+    "graph_pool_handle",
     "init",
     "initial_seed",
     "is_available",

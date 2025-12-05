@@ -156,6 +156,13 @@ void XPUGraph::reset() {
   }
 }
 
+// Returns an id another graph's capture_begin can use to share the same memory pool as this graph.
+MempoolId_t XPUGraph::pool() {
+TORCH_CHECK(capture_ended_,
+              "Called XPUGraph::pool() without a preceding successful capture.");
+  return mempool_id_;
+}
+
 XPUGraph::~XPUGraph() {
   for (auto& [generator_state, wholegraph_increments] :
        captured_generator_states_) {
