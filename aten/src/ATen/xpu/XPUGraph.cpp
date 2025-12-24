@@ -65,6 +65,7 @@ void XPUGraph::capture_begin(MempoolId_t pool) {
   }
 
   c10::xpu::XPUCachingAllocator::beginAllocateToPool(capture_dev_, mempool_id_, [this](sycl::queue* queue) {
+    // Compare queue pointers rather than queue objects to avoid expensive queue comparison operations.
     return queue->ext_oneapi_get_state() == queue_state::recording && queue == &capture_stream_.queue();
   });
 
@@ -154,6 +155,40 @@ void XPUGraph::reset() {
     graph_exec_.reset();
     has_graph_exec_ = false;
   }
+}
+
+void XPUGraph::enable_debug_mode() {
+  _xpu_graphs_debug = true;
+}
+
+void XPUGraph::debug_dump(const std::string& debug_path) {
+  if (_xpu_graphs_debug || keep_graph_) {
+    TORCH_WARN("DEBUG: calling debug_dump()");
+    if (has_graph_) {
+        TORCH_WARN("DEBUG: calling print_graph(verbose=1) to ", debug_path);
+        graph_->print_graph(debug_path, /* verbose = */ 1);
+      if (!keep_graph_) {
+        graph_.reset();
+        has_graph_ = false;
+      }
+    }
+  } else {
+    TORCH_WARN("XPU Graphs debug not enabled, set with [graph].enable_debug_mode()");
+  }
+}
+
+// Is it necessary to have keep_graph_ = true to access the raw xpuGraph_t instance?
+xpuGraph_t* XPUGraph::raw_xpu_graph() {
+  TORCH_CHECK(keep_graph_, "You cannot access the raw xpuGraph_t instance unless XPUGraph was initialized with keep_graph=true");
+  TORCH_CHECK(has_graph_, "You cannot access the raw xpuGraph_t instance until capture_end() has been called");
+  return graph_.get();
+}
+
+xpuGraphExec_t* XPUGraph::raw_xpu_graph_exec() {
+  TORCH_CHECK(
+      has_graph_exec_,
+      "You cannot access the raw xpuGraphExec_t instance until instantiate() has been called");
+  return graph_exec_.get();
 }
 
 // Returns an id another graph's capture_begin can use to share the same memory pool as this graph.
