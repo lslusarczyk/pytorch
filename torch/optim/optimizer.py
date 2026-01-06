@@ -459,18 +459,34 @@ class Optimizer:
         # https://github.com/pytorch/pytorch/blob/d3ba8901d8640eb16f88b2bfef9df7fa383d4b47/torch/_inductor/compile_fx.py#L390.
         # Thus, when compiling, inductor will determine if cudagraphs
         # can be enabled based on whether there is input mutation or CPU tensors.
-        if (
-            not torch.compiler.is_compiling()
-            and torch.backends.cuda.is_built()
+
+        # Check CUDA
+        cuda_available = (
+            torch.backends.cuda.is_built()
             and torch.cuda.is_available()
-        ):
-            capturing = torch.cuda.is_current_stream_capturing()
+        )
+        # Check XPU
+        xpu_available = (
+            hasattr(torch, "xpu")
+            and torch.xpu.is_available()  # type: ignore[attr-defined]
+        )
+
+        if not torch.compiler.is_compiling() and (cuda_available or xpu_available):
+            capturing = False
+            device_name = ""
+
+            if cuda_available:
+                capturing = torch.cuda.is_current_stream_capturing()
+                device_name = "CUDA"
+            elif xpu_available:
+                capturing = torch.xpu.is_current_stream_capturing()  # type: ignore[attr-defined]
+                device_name = "XPU"
 
             if capturing and not all(
                 group["capturable"] for group in self.param_groups
             ):
                 raise RuntimeError(
-                    "Attempting CUDA graph capture of step() for an instance of "
+                    f"Attempting {device_name} graph capture of step() for an instance of "
                     + self.__class__.__name__
                     + " but param_groups' capturable is False."
                 )
@@ -482,7 +498,7 @@ class Optimizer:
             ):
                 warnings.warn(
                     "This instance was constructed with capturable=True or some of all the param_groups came with capturable=True, "
-                    "but step() is running without CUDA graph capture. If you never intend to graph-capture this "
+                    f"but step() is running without {device_name} graph capture. If you never intend to graph-capture this "
                     "instance, capturable=True can impair performance, and you should set capturable=False.",
                     stacklevel=2,
                 )
