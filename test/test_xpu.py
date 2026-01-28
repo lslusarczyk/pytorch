@@ -1158,18 +1158,16 @@ if __name__ == "__main__":
             z[0] = z[0] + 1.0
             self.assertEqual(z, x)
 
-    @unittest.skipIf(True, "API is not ready, skipping tests")
+    @unittest.skipIf(not TEST_XPU, "XPU not available, skipping tests")
     def test_graph_is_current_stream_capturing(self):
         self.assertFalse(torch.xpu.is_current_stream_capturing())
-
-        if TEST_XPU:
-            s = torch.xpu.Stream()
-            with torch.xpu.stream(s):
-                g = torch.xpu.XPUGraph()
-                self.assertFalse(torch.xpu.is_current_stream_capturing())
-                g.capture_begin()
-                self.assertTrue(torch.xpu.is_current_stream_capturing())
-                g.capture_end()
+        s = torch.xpu.Stream()
+        with torch.xpu.stream(s):
+            g = torch.xpu.XPUGraph()
+            self.assertFalse(torch.xpu.is_current_stream_capturing())
+            g.capture_begin()
+            self.assertTrue(torch.xpu.is_current_stream_capturing())
+            g.capture_end()
 
     @unittest.skipIf(not TEST_XPU, "XPU not available, skipping tests")
     def test_graph_capture_simple(self):
