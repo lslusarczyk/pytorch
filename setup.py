@@ -1265,7 +1265,7 @@ class build_ext(setuptools.command.build_ext.build_ext):
         if cmake_cache_vars["USE_XPU"]:
             report(f"-- Detected XPU runtime at {cmake_cache_vars['SYCL_LIBRARY_DIR']}")
         else:
-            report("-- Not using XPU")
+            sys.exit(1)
         if cmake_cache_vars["USE_MKLDNN"]:
             report("-- Using MKLDNN")
             if cmake_cache_vars["USE_MKLDNN_ACL"]:
