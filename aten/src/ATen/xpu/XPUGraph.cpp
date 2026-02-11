@@ -107,8 +107,12 @@ void XPUGraph::capture_end() {
     wholegraph_increments = generator_state->capture_epilogue();
   }
 
+#if defined(__clang__) && (__clang_major__ >= 22)
+  if (graph_->empty()) {
+#else
   size_t num_xpu_graph_nodes = graph_->get_nodes().size();
   if (num_xpu_graph_nodes == 0) {
+#endif     
     TORCH_WARN(
         "The XPU Graph is empty. This usually means that the graph was ",
         "attempted to be captured on wrong device or stream.");
