@@ -54,7 +54,20 @@ def run_eager(model, x, iters, fine_grain_itt):
         torch.xpu.synchronize()
         return (time.perf_counter() - start) / iters
 
-def run_xpu_graph(model, x, iters, fine_grain_itt):
+def _compare_graph_to_eager(ref_y, static_y, *, rtol=1e-2, atol=1e-2):
+    ok = torch.allclose(ref_y, static_y, rtol=rtol, atol=atol)
+    if not ok:
+        diff = (ref_y - static_y).abs()
+        max_abs = diff.max().item()
+        denom = ref_y.abs().clamp(min=1e-8)
+        max_rel = (diff / denom).max().item()
+        raise AssertionError(
+            f"graph vs eager mismatch (rtol={rtol}, atol={atol}): "
+            f"max_abs_diff={max_abs:.3e}, max_rel_diff={max_rel:.3e}"
+        )
+
+
+def run_xpu_graph(model, x, iters, fine_grain_itt, ref_y=None):
     g = torch.xpu.XPUGraph()
     static_x = x.clone()
 
@@ -64,6 +77,15 @@ def run_xpu_graph(model, x, iters, fine_grain_itt):
 
     with torch.xpu.graph(g):
         static_y = model(static_x)
+
+    if ref_y is not None:
+        # On XPU, capture only records; outputs are written on replay(). Replay once
+        # so static_y holds the graph result, then compare to eager ref_y.
+        static_x.copy_(x)
+        g.replay()
+        torch.xpu.synchronize()
+        _compare_graph_to_eager(ref_y, static_y)
+        print("verify: graph vs eager match (rtol=1e-2, atol=1e-2)")
 
     torch.xpu.synchronize()
     with profiler.emit_itt(), profiler.record_function("xpugraph"):
@@ -87,16 +109,33 @@ def main():
     parser.add_argument("--width", type=int, default=128)
     parser.add_argument("--iters", type=int, default=1000)
     parser.add_argument("--fine-grain-itt", action="store_true")
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Verify that graph replay produces close results to eager (same input).",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Use torch.compile on the model (requires Triton with Intel/XPU backend; pip Triton often has none).",
+    )
     args = parser.parse_args()
 
     assert torch.xpu.is_available()
 
     device = "xpu"
     model = TinyKernelStorm(args.depth, args.width).to(device).eval()
+    if args.compile:
+        model = torch.compile(model)
     x = torch.randn(1, args.width, device=device)
 
+    ref_y = None
+    if args.verify:
+        ref_y = model(x)
+        torch.xpu.synchronize()
+
     eager_t = run_eager(model, x, args.iters, args.fine_grain_itt)
-    graph_t = run_xpu_graph(model, x, args.iters, args.fine_grain_itt)
+    graph_t = run_xpu_graph(model, x, args.iters, args.fine_grain_itt, ref_y=ref_y)
 
     print(f"Eager:     {eager_t * 1000:.3f} ms")
     print(f"XPUGraph:  {graph_t * 1000:.3f} ms")

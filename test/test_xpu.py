@@ -2409,6 +2409,19 @@ if __name__ == "__main__":
         graph.replay()
         self.assertTrue(torch.all(x == 6.0))
 
+    def test_xpu_graph_replay_matches_eager(self):
+        """Graph replay should produce the same result as eager for the same input."""
+        x = torch.ones(100, device="xpu")
+        ref_y = x + 1.0
+
+        g = torch.xpu.XPUGraph()
+        static_x = x.clone()
+        with torch.xpu.graph(g):
+            static_y = static_x + 1.0
+
+        g.replay()
+        self.assertEqual(ref_y, static_y, rtol=0, atol=0)
+
 
 @contextlib.contextmanager
 def caching_host_allocator_use_host_register(use_xpu_host_register: bool):
