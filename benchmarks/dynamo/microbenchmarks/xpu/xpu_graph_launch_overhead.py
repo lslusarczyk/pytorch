@@ -24,7 +24,8 @@ VTune (Intel VTune Profiler):
     How to view in VTune (names vary slightly by VTune version):
 
     1. GUI: New Project -> Launch Application -> set Python as the app and pass
-       this script + args (e.g. --iters 100 --depth 50 --width 128).
+       this script + args (default model is minimal; e.g. tiny_kernel_storm --iters 100
+       --depth 50 --width 128).
 
     2. Choose an analysis that collects user/ITT instrumentation, e.g. Hotspots
        (User-Mode Sampling) or Threading, and enable ITT / user task collection
@@ -37,11 +38,19 @@ VTune (Intel VTune Profiler):
 
     4. CLI example (adjust -collect and knobs for your VTune install):
        vtune -collect hotspots -knob collect-user-itt-api=true -- \\
-           python xpu_graph_launch_overhead.py --iters 100 --depth 50 --width 128
+           python xpu_graph_launch_overhead.py --iters 100
+           python xpu_graph_launch_overhead.py tiny_kernel_storm --iters 100 --depth 50 --width 128
 
     Warmup before the ITT-wrapped sections is not annotated; only the measured
     loops inside emit_itt() show dense ITT marks.
 """
+
+class MinimalAddKernel(nn.Module):
+    """One trivial XPU op: element-wise add (minimal launch overhead baseline)."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + 1.0
+
 
 class TinyKernelStorm(nn.Module):
     def __init__(self, depth, width):
@@ -90,7 +99,7 @@ def _compare_graph_to_eager(ref_y, static_y, *, rtol=1e-2, atol=1e-2):
         )
 
 
-def run_xpu_graph(model, x, iters, fine_grain_itt, ref_y=None):
+def run_xpu_graph(model, x, iters, fine_grain_itt, ref_y=None, batch_size=None):
     g = torch.xpu.XPUGraph()
     static_x = x.clone()
 
@@ -100,7 +109,7 @@ def run_xpu_graph(model, x, iters, fine_grain_itt, ref_y=None):
 
     with torch.xpu.graph(g):
         static_y = model(static_x)
-    
+
     if ref_y is not None:
         # On XPU, capture only records; outputs are written on replay(). Replay once
         # so static_y holds the graph result, then compare to eager ref_y.
@@ -110,28 +119,63 @@ def run_xpu_graph(model, x, iters, fine_grain_itt, ref_y=None):
         _compare_graph_to_eager(ref_y, static_y)
         print("verify: graph vs eager match (rtol=1e-2, atol=1e-2)")
 
+    if batch_size is None:
+        batch_size = iters
+    batch_size = max(1, batch_size)
+
     torch.xpu.synchronize()
+    total_time = 0.0
     with profiler.emit_itt(), profiler.record_function("xpugraph"):
-        start = time.perf_counter()
-        for _ in range(iters):
-            if fine_grain_itt:
-                with profiler.record_function("xpugraph_iter"):
+        remaining = iters
+        while remaining > 0:
+            this_batch = min(batch_size, remaining)
+            start = time.perf_counter()
+            for _ in range(this_batch):
+                if fine_grain_itt:
+                    with profiler.record_function("xpugraph_iter"):
+                        #static_x.copy_(x)
+                        g.replay()
+                else:
                     #static_x.copy_(x)
                     g.replay()
-            else:
-                #static_x.copy_(x)
-                g.replay()
-        with profiler.record_function("xpugraph_synch"):
-            torch.xpu.synchronize()
-        end = time.perf_counter()
+            with profiler.record_function("xpugraph_synch"):
+                torch.xpu.synchronize()
+            end = time.perf_counter()
+            total_time += end - start
+            remaining -= this_batch
 
-    return (end - start) / iters
+    return total_time / iters
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=(
+            "XPUGraph launch overhead benchmark. "
+            "Default model is minimal (single add). "
+            "Use tiny_kernel_storm for depth/width stack of Linear+ReLU blocks."
+        )
+    )
+    parser.add_argument(
+        "model",
+        nargs="?",
+        default="minimal",
+        choices=("minimal", "tiny_kernel_storm"),
+        help="minimal (default): one add kernel; tiny_kernel_storm: use --depth/--width.",
+    )
     parser.add_argument("--depth", type=int, default=200)
     parser.add_argument("--width", type=int, default=128)
     parser.add_argument("--iters", type=int, default=1000)
+    parser.add_argument(
+        "--batch",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "In the timed XPUGraph section: synchronize every N replay iterations. "
+            "Each perf_counter interval covers one batch (N replays + sync); "
+            "a final partial batch is timed and synced the same way. "
+            "Default: N = --iters (one batch, sync only at end)."
+        ),
+    )
     parser.add_argument("--fine-grain-itt", action="store_true")
     parser.add_argument(
         "--verify",
@@ -149,14 +193,21 @@ def main():
         help="Also run eager timing and print speedup vs graph. Default: graph path only.",
     )
     args = parser.parse_args()
+    batch_size = args.batch if args.batch is not None else args.iters
+    if batch_size < 1:
+        raise SystemExit("--batch must be >= 1")
 
     assert torch.xpu.is_available()
 
     device = "xpu"
-    model = TinyKernelStorm(args.depth, args.width).to(device).eval()
+    if args.model == "minimal":
+        model = MinimalAddKernel().to(device).eval()
+        x = torch.randn(1, device=device)
+    else:
+        model = TinyKernelStorm(args.depth, args.width).to(device).eval()
+        x = torch.randn(1, args.width, device=device)
     if args.compile:
         model = torch.compile(model)
-    x = torch.randn(1, args.width, device=device)
 
     ref_y = None
     if args.verify:
@@ -165,12 +216,26 @@ def main():
 
     if args.include_eager:
         eager_t = run_eager(model, x, args.iters, args.fine_grain_itt)
-        graph_t = run_xpu_graph(model, x, args.iters, args.fine_grain_itt, ref_y=ref_y)
+        graph_t = run_xpu_graph(
+            model,
+            x,
+            args.iters,
+            args.fine_grain_itt,
+            ref_y=ref_y,
+            batch_size=batch_size,
+        )
         print(f"Eager:     {eager_t * 1000:.3f} ms")
         print(f"XPUGraph:  {graph_t * 1000:.3f} ms")
         print(f"Speedup:   {eager_t / graph_t:.2f}x")
     else:
-        graph_t = run_xpu_graph(model, x, args.iters, args.fine_grain_itt, ref_y=ref_y)
+        graph_t = run_xpu_graph(
+            model,
+            x,
+            args.iters,
+            args.fine_grain_itt,
+            ref_y=ref_y,
+            batch_size=batch_size,
+        )
         print(f"XPUGraph:  {graph_t * 1000:.3f} ms")
 
 if __name__ == "__main__":
