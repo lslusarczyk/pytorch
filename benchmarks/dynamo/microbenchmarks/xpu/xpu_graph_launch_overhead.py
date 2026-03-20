@@ -100,11 +100,11 @@ def run_xpu_graph(model, x, iters, fine_grain_itt, ref_y=None):
 
     with torch.xpu.graph(g):
         static_y = model(static_x)
-
+    
     if ref_y is not None:
         # On XPU, capture only records; outputs are written on replay(). Replay once
         # so static_y holds the graph result, then compare to eager ref_y.
-        static_x.copy_(x)
+        #static_x.copy_(x)
         g.replay()
         torch.xpu.synchronize()
         _compare_graph_to_eager(ref_y, static_y)
@@ -116,12 +116,13 @@ def run_xpu_graph(model, x, iters, fine_grain_itt, ref_y=None):
         for _ in range(iters):
             if fine_grain_itt:
                 with profiler.record_function("xpugraph_iter"):
-                    static_x.copy_(x)
+                    #static_x.copy_(x)
                     g.replay()
             else:
-                static_x.copy_(x)
+                #static_x.copy_(x)
                 g.replay()
-        torch.xpu.synchronize()
+        with profiler.record_function("xpugraph_synch"):
+            torch.xpu.synchronize()
         end = time.perf_counter()
 
     return (end - start) / iters
