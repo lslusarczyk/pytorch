@@ -15,9 +15,32 @@ Expected:
 - Speedup decreases with width
 - Batch size fixed to 1
 
-VTune:
-This benchmark emits ITT ranges via torch.autograd.profiler.emit_itt()
-to enable CPU-side launch overhead analysis in Intel VTune.
+VTune (Intel VTune Profiler):
+    This benchmark uses torch.autograd.profiler.emit_itt() so each autograd op
+    emits Intel ITT (Instrumentation and Tracing Technology) ranges while the
+    timed eager / xpugraph sections run. profiler.record_function("eager" / "xpugraph")
+    adds named regions on top of that.
+
+    How to view in VTune (names vary slightly by VTune version):
+
+    1. GUI: New Project -> Launch Application -> set Python as the app and pass
+       this script + args (e.g. --iters 100 --depth 50 --width 128).
+
+    2. Choose an analysis that collects user/ITT instrumentation, e.g. Hotspots
+       (User-Mode Sampling) or Threading, and enable ITT / user task collection
+       in the analysis properties (look for "ITT", "User API", or
+       "Instrumentation and Tracing Technology").
+
+    3. Run the analysis. In the result, open the timeline / Platform view and
+       look for ITT task ranges (autograd op names, and regions like "eager",
+       "xpugraph", or "eager_iter" / "xpugraph_iter" with --fine-grain-itt).
+
+    4. CLI example (adjust -collect and knobs for your VTune install):
+       vtune -collect hotspots -knob collect-user-itt-api=true -- \\
+           python xpu_graph_launch_overhead.py --iters 100 --depth 50 --width 128
+
+    Warmup before the ITT-wrapped sections is not annotated; only the measured
+    loops inside emit_itt() show dense ITT marks.
 """
 
 class TinyKernelStorm(nn.Module):
@@ -119,6 +142,11 @@ def main():
         action="store_true",
         help="Use torch.compile on the model (requires Triton with Intel/XPU backend; pip Triton often has none).",
     )
+    parser.add_argument(
+        "--include-eager",
+        action="store_true",
+        help="Also run eager timing and print speedup vs graph. Default: graph path only.",
+    )
     args = parser.parse_args()
 
     assert torch.xpu.is_available()
@@ -134,12 +162,15 @@ def main():
         ref_y = model(x)
         torch.xpu.synchronize()
 
-    eager_t = run_eager(model, x, args.iters, args.fine_grain_itt)
-    graph_t = run_xpu_graph(model, x, args.iters, args.fine_grain_itt, ref_y=ref_y)
-
-    print(f"Eager:     {eager_t * 1000:.3f} ms")
-    print(f"XPUGraph:  {graph_t * 1000:.3f} ms")
-    print(f"Speedup:   {eager_t / graph_t:.2f}x")
+    if args.include_eager:
+        eager_t = run_eager(model, x, args.iters, args.fine_grain_itt)
+        graph_t = run_xpu_graph(model, x, args.iters, args.fine_grain_itt, ref_y=ref_y)
+        print(f"Eager:     {eager_t * 1000:.3f} ms")
+        print(f"XPUGraph:  {graph_t * 1000:.3f} ms")
+        print(f"Speedup:   {eager_t / graph_t:.2f}x")
+    else:
+        graph_t = run_xpu_graph(model, x, args.iters, args.fine_grain_itt, ref_y=ref_y)
+        print(f"XPUGraph:  {graph_t * 1000:.3f} ms")
 
 if __name__ == "__main__":
     main()
