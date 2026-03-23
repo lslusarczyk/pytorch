@@ -34,7 +34,8 @@ VTune (Intel VTune Profiler):
 
     3. Run the analysis. In the result, open the timeline / Platform view and
        look for ITT task ranges (autograd op names, and regions like "eager",
-       "xpugraph", or "eager_iter" / "xpugraph_iter" with --fine-grain-itt).
+       "xpugraph", or with --fine-grain-itt: "eager_iter", "xpugraph_iter",
+       "xpugraph_synch" per batch).
 
     4. CLI example (adjust -collect and knobs for your VTune install):
        vtune -collect hotspots -knob collect-user-itt-api=true -- \\
@@ -138,7 +139,10 @@ def run_xpu_graph(model, x, iters, fine_grain_itt, ref_y=None, batch_size=None):
                 else:
                     #static_x.copy_(x)
                     g.replay()
-            with profiler.record_function("xpugraph_synch"):
+            if fine_grain_itt:
+                with profiler.record_function("xpugraph_synch"):
+                    torch.xpu.synchronize()
+            else:
                 torch.xpu.synchronize()
             end = time.perf_counter()
             total_time += end - start
