@@ -76,16 +76,20 @@ def run_eager(model, x, iters, fine_grain_itt):
         model(x)
     torch.xpu.synchronize()
 
-    with profiler.emit_itt(), profiler.record_function("eager"):
-        start = time.perf_counter()
-        for _ in range(iters):
-            if fine_grain_itt:
+    start = time.perf_counter()
+    with profiler.emit_itt(), profiler.record_function("eager"):    
+        if fine_grain_itt:
+            for _ in range(iters):
                 with profiler.record_function("eager_iter"):
-                    model(x)
-            else:
+                    model(x)    
+        else:
+            for _ in range(iters):
                 model(x)
+    
+    with profiler.record_function("eager_synch"):
         torch.xpu.synchronize()
-        return (time.perf_counter() - start) / iters
+        
+    return (time.perf_counter() - start) / iters
 
 def _compare_graph_to_eager(ref_y, static_y, *, rtol=1e-2, atol=1e-2):
     ok = torch.allclose(ref_y, static_y, rtol=rtol, atol=atol)
