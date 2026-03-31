@@ -72,7 +72,7 @@ IF(NOT MKLDNN_FOUND)
     endif()
     ExternalProject_Add(xpu_mkldnn_proj
       GIT_REPOSITORY https://github.com/lslusarczyk/oneDNN
-      GIT_TAG pytorch-optimize
+      GIT_TAG main
       PREFIX ${XPU_MKLDNN_DIR_PREFIX}
       BUILD_IN_SOURCE 0
       CMAKE_ARGS ${_xpu_mkldnn_ep_cmake_args}
