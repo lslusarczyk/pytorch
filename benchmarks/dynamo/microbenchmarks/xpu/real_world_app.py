@@ -38,10 +38,15 @@ def _configure_stdout_logger(name: str) -> logging.Logger:
 
 
 parser = argparse.ArgumentParser(description="Testing CUDA/SYCL Graphs.")
-parser.add_argument("--graphs", action="store_true", help="Use CUDA Graphs.")
+parser.add_argument(
+    "--graphs",
+    "--graph",
+    action="store_true",
+    help=("Use device capture/replay graphs (CUDA or XPU)."),
+)
 parser.add_argument("--profiler", action="store_true", help="Use profiler.")
 parser.add_argument("--logs", action="store_true", help="Log if cuda graphs are used or not.")  # alternatively set TORCH_LOGS="inductor,cuda_graphs"
-parser.add_argument("--autographs", action="store_true", help="Automatic use of graphs in torch.compile and with kernel fusions")
+parser.add_argument("--autographs", "--autograph", action="store_true", help="Automatic use of graphs in torch.compile and with kernel fusions")
 parser.add_argument("--compile", action="store_true", help="Call compile on model")
 parser.add_argument("--iter", type=int, default=3000, help="Number of iterations")
 parser.add_argument(
@@ -83,6 +88,10 @@ if batch_size < 1:
 
 logger = _configure_stdout_logger("real_world_app")
 
+if args.graphs and args.device == "cuda" and args.model == "retina":
+    logger.warning(
+        "RetinaNet eval postprocess_detections (NMS, masking, etc.) uses ops CUDA graph capture does not allow"
+    )
 
 def _itt_ctx():
     return profiler.emit_itt() if args.emit_itt else contextlib.nullcontext()
