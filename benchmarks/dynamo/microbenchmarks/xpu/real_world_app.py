@@ -1,6 +1,7 @@
 # shows real influence on production inference without using Eager Mode
 # model -> torch.compile -> with or without CUDA graphs
-# these are image classificatoin models
+# image classification / detection models, plus sd15: one Stable Diffusion 1.5 UNet denoise step
+# (typical target for manual graph capture/replay in diffusion loops — static shapes, many steps).
 #
 # VTune (Intel VTune Profiler):
 #   With --emit-itt, torch.autograd.profiler.emit_itt() marks each autograd op in the timed
@@ -61,7 +62,16 @@ parser.add_argument(
     ),
 )
 parser.add_argument("--device", type=str, choices=['xpu', 'cuda'], default='xpu', help="Which backend to use.")
-parser.add_argument("--model", type=str, choices=['resnet', 'transformer', 'retina', 'vit'], default='resnet', help="Which model to use.")
+parser.add_argument(
+    "--model",
+    type=str,
+    choices=["resnet", "transformer", "retina", "vit", "sd15"],
+    default="resnet",
+    help=(
+        "Which model to use. sd15 = one denoising forward of SD 1.5 UNet (runwayml/stable-diffusion-v1-5, "
+        "requires: pip install diffusers). Matches common manual graph use (repeated identical UNet steps)."
+    ),
+)
 parser.add_argument("--retina-size", type=int, default=224, help="retina input size")
 parser.add_argument(
     "--vit-size",
@@ -180,6 +190,50 @@ def _materialize_detection_transform_stats_on_device(model: torch.nn.Module, dev
     t.image_std = _tensor_on_dev(t.image_std)
 
 
+class _StableDiffusion15UNetDenoiseStep(torch.nn.Module):
+    """Single UNet forward as in one diffusion timestep (SD 1.5, 512 px -> 64x64 latent)."""
+
+    def __init__(self, unet: torch.nn.Module, device: torch.device, dtype: torch.dtype) -> None:
+        super().__init__()
+        self.unet = unet
+        self.register_buffer(
+            "timestep",
+            torch.tensor([500], device=device, dtype=torch.long),
+        )
+        self.register_buffer(
+            "encoder_hidden_states",
+            torch.randn(1, 77, 768, device=device, dtype=dtype),
+        )
+
+    def forward(self, sample: torch.Tensor) -> torch.Tensor:
+        out = self.unet(
+            sample,
+            self.timestep,
+            encoder_hidden_states=self.encoder_hidden_states,
+            return_dict=False,
+        )
+        return out[0]
+
+
+def _load_sd15_unet_benchmark(device: str, dtype: torch.dtype) -> torch.nn.Module:
+    try:
+        from diffusers import UNet2DConditionModel
+    except ImportError as e:
+        raise SystemExit(
+            "--model sd15 requires the `diffusers` package. Install with: pip install diffusers"
+        ) from e
+
+    dev = torch.device(device)
+    logger.info("load SD 1.5 UNet (runwayml/stable-diffusion-v1-5, subfolder unet)...")
+    unet = UNet2DConditionModel.from_pretrained(
+        "runwayml/stable-diffusion-v1-5",
+        subfolder="unet",
+        torch_dtype=dtype,
+    )
+    unet = unet.to(dev).eval()
+    return _StableDiffusion15UNetDenoiseStep(unet, dev, dtype)
+
+
 torch.set_float32_matmul_precision('high')
 
 class Backend:
@@ -242,6 +296,8 @@ elif args.model == 'vit':
     model = model.to(args.device)
     logger.info("set model to eval")
     model = model.eval()
+elif args.model == "sd15":
+    model = _load_sd15_unet_benchmark(args.device, torch.float32)
 else:
     raise RuntimeError(f"unknown model {args.model}")
 
@@ -270,6 +326,10 @@ if args.model == 'retina':
 elif args.model == 'vit':
     size = args.vit_size
     x = torch.randn(1, 3, size, size, device=args.device)
+    is_list_input = False
+elif args.model == "sd15":
+    # SD 1.5 @ 512x512: latent (B, 4, 64, 64); same tensor each replay iteration (like fixed-shape denoise).
+    x = torch.randn(1, 4, 64, 64, device=args.device, dtype=torch.float32)
     is_list_input = False
 else:
     x = torch.randn(1, 3, 224, 224, device=args.device)
