@@ -67,9 +67,10 @@ class XPUGraph(_XPUGraph):
         native_recording (bool, optional): If True, the underlying SYCL
             modifiable ``command_graph`` is constructed with
             ``ext::oneapi::experimental::property::graph::enable_native_recording``
-            (Level Zero native graph capture) when PyTorch was built with
-            Clang 22+ and a matching SYCL stack. Otherwise a warning is issued
-            and standard graph capture is used.
+            (Level Zero native graph capture) when ``SYCL_COMPILER_VERSION``
+            (from CMake ``FindSYCLToolkit``, passed to all XPU TUs including GCC)
+            meets a minimum fixed at PyTorch compile time in ``XPUGraph.cpp``.
+            Otherwise a warning is issued and standard capture is used.
 
     """
 
