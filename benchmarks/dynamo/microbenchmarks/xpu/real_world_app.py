@@ -134,6 +134,29 @@ def _compare_outputs(ref, graph_out, *, rtol=1e-1, atol=1e-1, name="output"):
     raise TypeError(f"{name}: unsupported output type {type(ref)}")
 
 
+def _materialize_detection_transform_stats_on_device(model: torch.nn.Module, device: str) -> None:
+    """GeneralizedRCNNTransform keeps image_mean / image_std as Python lists. During forward,
+    torchvision builds mean/std via torch.as_tensor(..., device=image.device), which can
+    trigger a CPU→device copy that CUDA graph capture rejects unless the source is pinned.
+    Storing mean/std as tensors already on the target device avoids that copy inside capture."""
+    root = getattr(model, "_orig_mod", model)
+    t = getattr(root, "transform", None)
+    if t is None or not hasattr(t, "image_mean") or not hasattr(t, "image_std"):
+        return
+    dev = torch.device(device)
+    dtype = next(root.parameters()).dtype
+
+    def _tensor_on_dev(x):
+        if isinstance(x, torch.Tensor):
+            if x.device == dev and x.dtype == dtype:
+                return x
+            return x.to(device=dev, dtype=dtype)
+        return torch.tensor(x, dtype=dtype, device=dev)
+
+    t.image_mean = _tensor_on_dev(t.image_mean)
+    t.image_std = _tensor_on_dev(t.image_std)
+
+
 torch.set_float32_matmul_precision('high')
 
 class Backend:
@@ -239,6 +262,8 @@ with torch.inference_mode():
     N = args.iter
 
     if args.graphs:
+        if args.model == "retina":
+            _materialize_detection_transform_stats_on_device(model, args.device)
         logger.info("prepare graph")
         g = backend.create_graph()
 
