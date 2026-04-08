@@ -59,12 +59,14 @@ struct TORCH_XPU_API XPUGraphImpl : public at::GraphImplInterface {
   c10::DeviceIndex capture_dev_{UNDEFINED_DEVICE};
 
   bool keep_graph_;
+  bool native_recording_;
 };
 
 struct TORCH_XPU_API XPUGraph {
-  XPUGraph(bool keep_graph = false) {
+  XPUGraph(bool keep_graph = false, bool native_recording = false) {
     GraphImplArgs args;
     args.keep_graph = keep_graph;
+    args.native_recording = native_recording;
     impl_ = std::make_unique<XPUGraphImpl>(args);
   }
   ~XPUGraph() = default;

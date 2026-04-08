@@ -71,6 +71,15 @@ parser.add_argument(
 )
 parser.add_argument("--skip-consistency-check", action="store_true", help="Skip graph vs eager consistency check when using --graphs.")
 parser.add_argument(
+    "--native",
+    action="store_true",
+    help=(
+        "XPU only with --graphs: build the SYCL command_graph with "
+        "property::graph::enable_native_recording (Level Zero native graph capture). "
+        "Requires a SYCL/UR stack that supports it."
+    ),
+)
+parser.add_argument(
     "--fine-grain-itt",
     action="store_true",
     help="Per-iteration record_function regions and labeled sync for VTune (see module docstring).",
@@ -87,6 +96,11 @@ if batch_size < 1:
     raise SystemExit("--batch must be >= 1")
 
 logger = _configure_stdout_logger("real_world_app")
+
+if args.native and args.device != "xpu":
+    raise SystemExit("--native is only supported for --device xpu")
+if args.native and not args.graphs:
+    raise SystemExit("--native requires --graphs")
 
 if args.graphs and args.device == "cuda" and args.model == "retina":
     logger.warning(
@@ -178,7 +192,12 @@ class Backend:
         elif args.device == 'xpu':
             assert torch.xpu.is_available()
             self.synchronize = torch.xpu.synchronize
-            self.create_graph = torch.xpu.XPUGraph
+            if args.native:
+                self.create_graph = lambda: torch.xpu.XPUGraph(
+                    native_recording=True
+                )
+            else:
+                self.create_graph = torch.xpu.XPUGraph
             self.graph = torch.xpu.graph
             self.empty_cache = torch.xpu.empty_cache
         else:

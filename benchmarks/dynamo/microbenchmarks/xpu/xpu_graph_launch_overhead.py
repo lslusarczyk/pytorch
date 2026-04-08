@@ -104,8 +104,17 @@ def _compare_graph_to_eager(ref_y, static_y, *, rtol=1e-2, atol=1e-2):
         )
 
 
-def run_xpu_graph(model, x, iters, fine_grain_itt, ref_y=None, batch_size=None):
-    g = torch.xpu.XPUGraph()
+def run_xpu_graph(
+    model,
+    x,
+    iters,
+    fine_grain_itt,
+    ref_y=None,
+    batch_size=None,
+    *,
+    native_recording=False,
+):
+    g = torch.xpu.XPUGraph(native_recording=native_recording)
     static_x = x.clone()
 
     for _ in range(10):
@@ -200,6 +209,14 @@ def main():
         action="store_true",
         help="Also run eager timing and print speedup vs graph. Default: graph path only.",
     )
+    parser.add_argument(
+        "--native",
+        action="store_true",
+        help=(
+            "Create XPUGraph with SYCL property::graph::enable_native_recording "
+            "(Level Zero native graph capture). Requires a capable SYCL/UR stack."
+        ),
+    )
     args = parser.parse_args()
     batch_size = args.batch if args.batch is not None else args.iters
     if batch_size < 1:
@@ -231,6 +248,7 @@ def main():
             args.fine_grain_itt,
             ref_y=ref_y,
             batch_size=batch_size,
+            native_recording=args.native,
         )
         print(f"Eager:     {eager_t * 1000:.3f} ms")
         print(f"XPUGraph:  {graph_t * 1000:.3f} ms")
@@ -243,6 +261,7 @@ def main():
             args.fine_grain_itt,
             ref_y=ref_y,
             batch_size=batch_size,
+            native_recording=args.native,
         )
         print(f"XPUGraph:  {graph_t * 1000:.3f} ms")
 

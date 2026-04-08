@@ -3,6 +3,10 @@
 #include <ATen/xpu/XPUGraph.h>
 #include <c10/xpu/XPUFunctions.h>
 
+// Graph property enable_native_recording: see LLVM SYCL
+// sycl/ext/oneapi/experimental/detail/properties/graph_properties.def
+#include <sycl/ext/oneapi/experimental/graph.hpp>
+
 #include <cstddef>
 
 namespace at::xpu {
@@ -17,7 +21,8 @@ MempoolId_t graph_pool_handle() {
 
 XPUGraphImpl::XPUGraphImpl(const GraphImplArgs& args)
     : capture_stream_(at::xpu::getCurrentXPUStream()),
-      keep_graph_(args.keep_graph) {}
+      keep_graph_(args.keep_graph),
+      native_recording_(args.native_recording) {}
 
 void XPUGraphImpl::register_generator_state(
     c10::intrusive_ptr<at::XPUGeneratorState> state) {
@@ -101,8 +106,22 @@ void XPUGraphImpl::capture_begin(
         return filter(XPUStream(XPUStream::UNCHECKED, stream));
       });
 
-  auto graph_impl = xpuGraph_t(capture_stream_.queue());
-  graph_ = std::make_unique<xpuGraph_t>(std::move(graph_impl));
+#if defined(__clang__) && (__clang_major__ >= 22)
+  const sycl::property_list graph_props = native_recording_
+      ? sycl::property_list{property::graph::enable_native_recording{}}
+      : sycl::property_list{};
+#else
+  if (native_recording_) {
+    TORCH_WARN_ONCE(
+        "torch.xpu.XPUGraph(native_recording=True) requires PyTorch built "
+        "with Clang 22+ and a SYCL stack that provides "
+        "ext::oneapi::experimental::property::graph::enable_native_recording. "
+        "Falling back to standard graph capture.");
+  }
+  const sycl::property_list graph_props{};
+#endif
+  graph_ = std::make_unique<xpuGraph_t>(
+      xpuGraph_t(capture_stream_.queue(), graph_props));
   graph_->begin_recording(capture_stream_.queue());
 
   TORCH_INTERNAL_ASSERT(
@@ -126,12 +145,15 @@ void XPUGraphImpl::capture_end() {
     wholegraph_increments = generator_state->capture_epilogue();
   }
 
+  // Clang 22+: empty() is available; native recording may be used (get_nodes()
+  // throws for those graphs). Older toolchains: no native property, always
+  // use get_nodes() for the empty check.
 #if defined(__clang__) && (__clang_major__ >= 22)
-  if (graph_->empty()) {
+  const bool graph_is_empty = graph_->empty();
 #else
-  size_t num_xpu_graph_nodes = graph_->get_nodes().size();
-  if (num_xpu_graph_nodes == 0) {
-#endif     
+  const bool graph_is_empty = (graph_->get_nodes().size() == 0);
+#endif
+  if (graph_is_empty) {
     TORCH_WARN(
         "The XPU Graph is empty. This usually means that the graph was ",
         "attempted to be captured on wrong device or stream.");
