@@ -127,6 +127,10 @@
 #     specify the version of PyTorch, rather than the hard-coded version
 #     in this file; used when we're building binaries for distribution
 #
+#   PYTORCH_BUILD_DIR
+#     CMake build directory (default: build). Use a distinct path per config,
+#     e.g. PYTORCH_BUILD_DIR=build-xpu-rwdi when switching CMAKE_BUILD_TYPE or flags.
+#
 #   TORCH_CUDA_ARCH_LIST
 #     specify which CUDA architectures to build for.
 #     ie `TORCH_CUDA_ARCH_LIST="6.0;7.0"`
@@ -271,7 +275,6 @@ if sys.version_info < python_min_version:
     sys.exit(-1)
 
 import filecmp
-import glob
 import importlib
 import itertools
 import json
@@ -315,6 +318,7 @@ os.environ["PYTHONPATH"] = os.pathsep.join(
 ).rstrip(os.pathsep)
 
 from tools.build_pytorch_libs import build_pytorch
+from tools.clean import clean as _clean
 from tools.generate_torch_version import get_torch_version
 from tools.setup_helpers.cmake import CMake, CMakeValue
 from tools.setup_helpers.env import (
@@ -1266,7 +1270,7 @@ class build_ext(setuptools.command.build_ext.build_ext):
         if cmake_cache_vars["USE_XPU"]:
             report(f"-- Detected XPU runtime at {cmake_cache_vars['SYCL_LIBRARY_DIR']}")
         else:
-            report("-- Not using XPU")
+            sys.exit(1)
         if cmake_cache_vars["USE_MKLDNN"]:
             report("-- Using MKLDNN")
             if cmake_cache_vars["USE_MKLDNN_ACL"]:
@@ -1461,21 +1465,7 @@ class clean(Command):
         pass
 
     def run(self) -> None:
-        ignores = (CWD / ".gitignore").read_text(encoding="utf-8")
-        for wildcard in filter(None, ignores.splitlines()):
-            if wildcard.strip().startswith("#"):
-                if "BEGIN NOT-CLEAN-FILES" in wildcard:
-                    # Marker is found and stop reading .gitignore.
-                    break
-                # Ignore lines which begin with '#'.
-            else:
-                # Don't remove absolute paths from the system
-                wildcard = wildcard.lstrip("./")
-                for filename in glob.iglob(wildcard):
-                    try:
-                        os.remove(filename)
-                    except OSError:
-                        shutil.rmtree(filename, ignore_errors=True)
+        _clean()
 
 
 # Need to dump submodule hashes and create the proper LICENSE.txt for the sdist

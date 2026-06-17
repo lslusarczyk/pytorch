@@ -1288,6 +1288,21 @@ if __name__ == "__main__":
 
         self.assertEqual(b.sum().item(), 11000.0)
 
+    def test_accelerator_graph_simple(self):
+        s = torch.Stream()
+        g = torch.accelerator.Graph()
+
+        with s, g:
+            a = torch.full((1000,), 1, device="xpu")
+            b = a
+            for _ in range(10):
+                b = b + 1
+        torch.accelerator.current_stream().wait_stream(s)
+
+        g.replay()
+
+        self.assertEqual(b.sum().item(), 11000.0)
+
     def test_graphsafe_set_get_rng_state(self):
         # Define a function to create generator states, with optional graph registration
         def create_states(generator):
@@ -2393,6 +2408,19 @@ if __name__ == "__main__":
         self.assertTrue(torch.all(x == 4.0))
         graph.replay()
         self.assertTrue(torch.all(x == 6.0))
+
+    def test_xpu_graph_replay_matches_eager(self):
+        """Graph replay should produce the same result as eager for the same input."""
+        x = torch.ones(100, device="xpu")
+        ref_y = x + 1.0
+
+        g = torch.xpu.XPUGraph()
+        static_x = x.clone()
+        with torch.xpu.graph(g):
+            static_y = static_x + 1.0
+
+        g.replay()
+        self.assertEqual(ref_y, static_y, rtol=0, atol=0)
 
 
 @contextlib.contextmanager

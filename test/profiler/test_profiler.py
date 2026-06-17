@@ -2726,21 +2726,34 @@ if KinetoStepTracker.current_step() != initial_step + 2 * niters:
                 y = torch.randn(10, 10)
                 z = torch.mm(x, y)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
     @unittest.skipIf(not kineto_available(), "Kineto is required")
-    def test_activity_filter_backward_compat(self):
-        """Plain activities=[CPU] still works unchanged."""
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as p:
-            x = torch.randn(10, 10).to("cuda")
-            y = torch.mm(x, x)
+    def test_profiler(self):
+        """Basic test for torch.profiler.profile API."""
+        use_cuda = torch.profiler.ProfilerActivity.CUDA in supported_activities()
+        activities = [ProfilerActivity.CPU]
+        if use_cuda:
+            activities.append(ProfilerActivity.CUDA)
+        with profile(activities=activities) as p:
+            self.payload(use_cuda=use_cuda)
         events = p.events()
         self.assertGreater(len(events), 0)
-        has_overhead = any(
-            "Lazy Function Loading" in e.name for e in events
-        )  # Lazy Function Loading is an OVERHEAD event
-        self.assertTrue(has_overhead)
+        found_gemm = False
+        found_memcpy = False
+        found_mm = False
+        for e in events:
+            if "aten::mm" in e.name:
+                found_mm = True
+            if "gemm" in e.name.lower() or "Cijk" in e.name:
+                found_gemm = True
+            if "memcpy" in e.name.lower() or "__amd_rocclr_copyBuffer" in e.name:
+                found_memcpy = True
+        self.assertTrue(found_mm)
+        if use_cuda:
+            self.assertTrue(found_gemm)
+            self.assertTrue(found_memcpy)
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
+    @unittest.skipIf(TEST_WITH_ROCM, "not supported on ROCm")
     @unittest.skipIf(not kineto_available(), "Kineto is required")
     def test_activity_filter_dict_syntax(self):
         """Dict syntax collects only the requested activity types."""
@@ -3764,12 +3777,17 @@ class TestProfilerEventsParity(TestCase):
     """Tests validating parity between events() and export_chrome_trace() JSON."""
 
     def test_python_function_events_in_events(self):
+        class DummyModule(nn.Module):
+            def forward(self, x):
+                return x + 1
+
+        mod = DummyModule()
         with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            activities=[ProfilerActivity.CPU],
             with_stack=True,
+            experimental_config=_ExperimentalConfig(verbose=True),
         ) as prof:
-            x = torch.randn(10, 10, device="cuda")
-            torch.mm(x, x)
+            mod(torch.randn(4, 4))
 
         events = prof.events()
         python_events = [e for e in events if e.is_python_function]
@@ -3778,7 +3796,6 @@ class TestProfilerEventsParity(TestCase):
             self.assertIsInstance(e.name, str)
             self.assertGreater(e.time_range.end - e.time_range.start, 0)
 
-        # Parity: count should match python_function events in Chrome trace
         with TemporaryFileName(mode="w+") as fname:
             prof.export_chrome_trace(fname)
             with open(fname) as f:
@@ -3790,6 +3807,22 @@ class TestProfilerEventsParity(TestCase):
                 if e.get("cat") == "python_function" and e.get("ph") == "X"
             ]
             self.assertEqual(len(python_events), len(json_py))
+
+            # Verify python_id/parent_id/module_id parity with JSON args
+            fe_mod = next((e for e in events if "DummyModule" in e.name), None)
+            self.assertIsNotNone(fe_mod)
+            self.assertGreater(fe_mod.python_id, 0)
+            self.assertGreaterEqual(fe_mod.python_module_id, 0)
+
+            json_mod = next(
+                (e for e in json_py if "DummyModule" in e.get("name", "")),
+                None,
+            )
+            self.assertIsNotNone(json_mod)
+            args = json_mod["args"]
+            self.assertEqual(fe_mod.python_id, args["Python id"])
+            self.assertEqual(fe_mod.python_parent_id, args["Python parent id"])
+            self.assertEqual(fe_mod.python_module_id, args["Python module id"])
 
     def test_profiler_flow_events_parity(self):
         """Verify that async CPU->GPU flow fields on events() match Chrome trace JSON."""
@@ -3924,6 +3957,56 @@ class TestProfilerEventsParity(TestCase):
                 msg="Recovered Chrome trace ts doesn't match JSON for aten::mm",
             )
 
+    def test_profiler_op_args_events_parity(self):
+        """Verify that cpu_op args on events() match Chrome trace JSON args."""
+        base_tensor = torch.randn(1024, dtype=torch.float32)
+        a = base_tensor.as_strided((16, 16), (17, 1), 0)
+        b = base_tensor.as_strided((16, 16), (25, 2), 272)
+        t1 = torch.ones((64, 32))
+        t2 = torch.ones((64, 32))
+        with profile(activities=[ProfilerActivity.CPU], record_shapes=True) as prof:
+            torch.add(a, b)
+            torch.cat([t1, t2])
+
+        fe_add = next((e for e in prof.events() if e.name == "aten::add"), None)
+        self.assertIsNotNone(fe_add)
+        fe_cat = next((e for e in prof.events() if e.name == "aten::cat"), None)
+        self.assertIsNotNone(fe_cat)
+
+        with TemporaryFileName(mode="w+") as fname:
+            prof.export_chrome_trace(fname)
+            with open(fname) as f:
+                j = json.load(f)
+
+            json_add = next(
+                (
+                    e
+                    for e in j["traceEvents"]
+                    if e.get("name") == "aten::add" and e.get("cat") == "cpu_op"
+                ),
+                None,
+            )
+            self.assertIsNotNone(json_add)
+            args = json_add["args"]
+            self.assertEqual(fe_add.input_shapes, args["Input Dims"])
+            self.assertEqual(fe_add.input_strides, args["Input Strides"])
+            self.assertEqual(fe_add.input_dtypes, args["Input type"])
+
+            # Test a case with TensorList inputs -- input_shapes should handle this
+            json_cat = next(
+                (
+                    e
+                    for e in j["traceEvents"]
+                    if e.get("name") == "aten::cat" and e.get("cat") == "cpu_op"
+                ),
+                None,
+            )
+            self.assertIsNotNone(json_cat)
+            args_cat = json_cat["args"]
+            self.assertEqual(fe_cat.input_shapes, args_cat["Input Dims"])
+            self.assertEqual(fe_cat.input_strides, args_cat["Input Strides"])
+            self.assertEqual(fe_cat.input_dtypes, args_cat["Input type"])
+
     def test_profiler_external_id_parity(self):
         """Verify that FunctionEvent.external_id matches External id in Chrome trace JSON."""
         from collections import Counter
@@ -3987,6 +4070,62 @@ class TestProfilerEventsParity(TestCase):
                     json_name_cats,
                     f"activity_type mismatch for {e.name}",
                 )
+
+    def test_structured_metadata_matches_chrome_trace(self):
+        from torch.autograd.profiler_util import _EVENT_METADATA_KEYS
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            experimental_config=torch._C._profiler._ExperimentalConfig(
+                expose_kineto_event_metadata=True
+            ),
+        ) as prof:
+            x = torch.randn(10, 10, device="cuda")
+            y = torch.mm(x, x)
+            z = x + y
+            z.cpu()
+
+        # Build lookup from External id -> FunctionEvent
+        fe_by_ext_id = {}
+        for fe in prof.events():
+            if fe.external_id != 0:
+                fe_by_ext_id[fe.external_id] = fe
+
+        with TemporaryFileName(mode="w+") as fname:
+            prof.export_chrome_trace(fname)
+            with open(fname) as f:
+                trace = json.load(f)
+
+            checked_kernel = 0
+            checked_memcpy = 0
+            for te in trace["traceEvents"]:
+                cat = te.get("cat", "")
+                args = te.get("args", {})
+                ext_id = args.get("External id")
+                if ext_id is None or ext_id not in fe_by_ext_id:
+                    continue
+                fe = fe_by_ext_id[ext_id]
+
+                if cat in ("kernel", "gpu_memcpy") and fe.event_metadata is not None:
+                    em = fe.event_metadata
+                    for kineto_key, (field_name, _) in _EVENT_METADATA_KEYS.items():
+                        if kineto_key in args:
+                            val = getattr(em, field_name)
+                            self.assertIsNotNone(
+                                val,
+                                f"'{fe.name}': {field_name} is None "
+                                f"but JSON has '{kineto_key}': {args[kineto_key]}",
+                            )
+                    if cat == "kernel":
+                        self.assertIsInstance(em.registers_per_thread, int)
+                        self.assertGreater(em.registers_per_thread, 0)
+                        checked_kernel += 1
+                    elif cat == "gpu_memcpy":
+                        if em.bytes is not None:
+                            self.assertGreater(em.bytes, 0)
+                        checked_memcpy += 1
+
+            self.assertGreater(checked_kernel, 0, "No kernel events were cross-checked")
 
 
 if __name__ == "__main__":

@@ -64,11 +64,20 @@ class XPUGraph(_XPUGraph):
             ``replay`` if ``instantiate`` was not already called. Calling
             ``instantiate`` manually before ``replay`` is recommended to
             prevent increased latency on the first call to ``replay``.
+        native_recording (bool, optional): If True, the underlying SYCL
+            modifiable ``command_graph`` is constructed with
+            ``ext::oneapi::experimental::property::graph::enable_native_recording``
+            (Level Zero native graph capture) when ``SYCL_COMPILER_VERSION``
+            (from CMake ``FindSYCLToolkit``, passed to all XPU TUs including GCC)
+            meets a minimum fixed at PyTorch compile time in ``XPUGraph.cpp``.
+            Otherwise a warning is issued and standard capture is used.
 
     """
 
-    def __new__(cls, keep_graph: bool = False) -> Self:
-        return super().__new__(cls, keep_graph)
+    def __new__(
+        cls, keep_graph: bool = False, native_recording: bool = False
+    ) -> Self:
+        return super().__new__(cls, keep_graph, native_recording)
 
     def capture_begin(self, pool: _POOL_HANDLE | None = None) -> None:
         r"""Begin capturing XPU work on the current xpu stream.

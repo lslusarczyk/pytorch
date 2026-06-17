@@ -1,8 +1,10 @@
 # Owner(s): ["module: custom-operators"]
 
 import contextlib
+import enum
 import gc
 import random
+import re
 import unittest
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -1029,7 +1031,7 @@ def forward(self, arg0_1, arg1_1):
             gm.code.strip("\n"),
             """\
 def forward(self, x_1, cfg_1):
-    process_with_config = torch.ops._TestOpaqueObject.process_with_config.default(x_1, cfg_1);  x_1 = cfg_1 = None
+    process_with_config = torch.ops._TestOpaqueObject.process_with_config.default(x_1, ValueConfig(mode='square'));  x_1 = None
     return process_with_config
     """,  # noqa: B950
         )
@@ -3076,6 +3078,23 @@ def forward(self, L_x_ : torch.Tensor, G_Color_GREEN : {_illegal_char_regex.sub(
             self.assertEqual(counters["inductor"]["fxgraph_cache_hit"], 1)
             self.assertEqual(counters["inductor"]["fxgraph_cache_miss"], 1)
 
+    def test_hoisted_value_type_make_fx(self):
+        def foo(x, hoisted_str):
+            return op_with_string(x, hoisted_str)
+
+        x = torch.randn(3, 3)
+        gm = make_fx(foo)(x, HoistedString("double"))
+
+        self.assertExpectedInline(
+            gm.code.strip(),
+            """\
+def forward(self, x_1, hoisted_str_1):
+    op_with_string = torch.ops.mylib.op_with_string.default(x_1, hoisted_str_1);  x_1 = hoisted_str_1 = None
+    return op_with_string""",  # noqa: B950
+        )
+        self.assertEqual(gm(x, HoistedString("double")), x * 2)
+        self.assertEqual(gm(x, HoistedString("square")), x * x)
+
     def test_opaque_class_literal_attribute_inlined(self):
         """Test that literal attributes on opaque classes are inlined without source tracking.
 
@@ -3245,23 +3264,26 @@ def forward(self, L_x_ : torch.Tensor):
         res.sum().backward()
 
         actual = normalize_gm(backend.graphs[0].print_readable(print_output=False))
+        # Normalize module-qualified opaque type names since they differ
+        # depending on how the test is invoked (__main__ vs test_opaque_obj_v2).
+        actual = re.sub(r"\w+_OpaqueMultiplier", "OpaqueMultiplier", actual)
         self.assertExpectedInline(
             actual,
             """\
 class GraphModule(torch.nn.Module):
-    def forward(self, L_x_: "f32[2, 2]", L_scale_obj_ : __main___OpaqueMultiplier):
+    def forward(self, L_x_: "f32[2, 2]", L_scale_obj_ : OpaqueMultiplier):
         l_x_ = L_x_
         l_scale_obj_ = L_scale_obj_
 
         subgraph_0 = self.subgraph_0
         invoke_subgraph = torch.ops.higher_order.invoke_subgraph(subgraph_0, 'subgraph_0', l_scale_obj_, l_x_);  subgraph_0 = l_scale_obj_ = l_x_ = None
-        getitem_2: "f32[2, 2]" = invoke_subgraph[0];  invoke_subgraph = None
+        getitem: "f32[2, 2]" = invoke_subgraph[0];  invoke_subgraph = None
 
-        add: "f32[2, 2]" = getitem_2 + getitem_2;  getitem_2 = None
+        add: "f32[2, 2]" = getitem + getitem;  getitem = None
         return (add,)
 
     class subgraph_0(torch.nn.Module):
-        def forward(self, l_scale_obj_ : __main___OpaqueMultiplier, l_x_: "f32[2, 2]"):
+        def forward(self, l_scale_obj_ : OpaqueMultiplier, l_x_: "f32[2, 2]"):
             result: "f32[2, 2]" = torch.ops._TestOpaqueObject.mul_with_scale(l_scale_obj_, l_x_);  l_scale_obj_ = l_x_ = None
 
             result_1: "f32[2, 2]" = result * 2;  result = None
@@ -3440,6 +3462,90 @@ def forward(self, p_linear_weight, p_linear_bias, obj_lifted_custom_0, x):
             dist.destroy_process_group()
             if already_initialized:
                 dist.init_process_group("fake", store=FakeStore(), rank=0, world_size=2)
+
+    def test_enum_export(self):
+        class Direction(enum.Enum):
+            UP = 0
+            DOWN = 1
+
+        class Mod(torch.nn.Module):
+            def forward(self, x, d):
+                return x + d.value
+
+        ep = torch.export.export(Mod(), (torch.randn(4, 4), Direction.UP), strict=False)
+        self.assertEqual(
+            ep.module()(torch.ones(4, 4), Direction.UP),
+            torch.ones(4, 4) + Direction.UP.value,
+        )
+        self.assertExpectedInline(
+            normalize_gm(ep.graph_module.print_readable(False)),
+            """\
+class GraphModule(torch.nn.Module):
+    def forward(self, x: "f32[4, 4]", d):
+        add: "f32[4, 4]" = torch.ops.aten.add.Tensor(x, 0);  x = None
+        return (add,)
+""",
+        )
+
+        backend = EagerAndRecordGraphs()
+        opt_fn = torch.compile(Mod(), backend=backend)
+        x = torch.randn(4, 4)
+        res = opt_fn(x, Direction.UP)
+        self.assertEqual(
+            res,
+            x + Direction.UP.value,
+        )
+        self.assertExpectedInline(
+            normalize_gm(backend.graphs[0].print_readable(False)),
+            """\
+class GraphModule(torch.nn.Module):
+    def forward(self, L_x_: "f32[4, 4]"):
+        l_x_ = L_x_
+
+        add: "f32[4, 4]" = l_x_ + 0;  l_x_ = None
+        return (add,)
+""",
+        )
+
+    def test_enum_custom_op(self):
+        def get_color():
+            class Color(enum.Enum):
+                RED = 0
+                GREEN = 1
+                BLUE = 2
+
+            return Color
+
+        Color = get_color()
+
+        @torch.library.custom_op("test_enum::add_color", mutates_args=())
+        def add_color(x: torch.Tensor, c: Color) -> torch.Tensor:
+            return x + c.value
+
+        @add_color.register_fake
+        def _(x, c):
+            return torch.empty_like(x)
+
+        def fn(x, c):
+            return add_color(x, c)
+
+        x = torch.randn(4, 4)
+        ref = fn(x, Color.GREEN)
+        backend = EagerAndRecordGraphs()
+        opt_fn = torch.compile(fn, backend=backend, fullgraph=True)
+        res = opt_fn(x, Color.GREEN)
+        self.assertEqual(ref, res)
+        self.assertExpectedInline(
+            normalize_gm(backend.graphs[0].print_readable(False)),
+            """\
+class GraphModule(torch.nn.Module):
+    def forward(self, L_x_: "f32[4, 4]"):
+        l_x_ = L_x_
+
+        add_color_default: "f32[4, 4]" = torch.ops.test_enum.add_color.default(l_x_, Color.GREEN);  l_x_ = None
+        return (add_color_default,)
+""",
+        )
 
     def test_subclass_parametrization_with_opaque_attrs(self):
         """unwrap_tensor_subclass_parameters should handle non-tensor attrs."""

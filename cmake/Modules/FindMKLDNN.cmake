@@ -45,12 +45,10 @@ IF(NOT MKLDNN_FOUND)
         list(APPEND DNNL_MAKE_COMMAND "--" "-l" "$ENV{MAX_JOBS}")
       endif()
     endif()
-    ExternalProject_Add(xpu_mkldnn_proj
-      GIT_REPOSITORY https://github.com/uxlfoundation/oneDNN
-      GIT_TAG v3.10.2
-      PREFIX ${XPU_MKLDNN_DIR_PREFIX}
-      BUILD_IN_SOURCE 0
-      CMAKE_ARGS  -DCMAKE_C_COMPILER=icx
+    # ExternalProject configures its own CMake tree; it does not inherit
+    # CMAKE_*_COMPILER_LAUNCHER from the PyTorch project unless passed explicitly.
+    set(_xpu_mkldnn_ep_cmake_args
+      -DCMAKE_C_COMPILER=icx
       -DCMAKE_CXX_COMPILER=${SYCL_CXX_DRIVER}
       -DDNNL_GPU_RUNTIME=SYCL
       -DDNNL_CPU_RUNTIME=THREADPOOL
@@ -60,6 +58,24 @@ IF(NOT MKLDNN_FOUND)
       -DDNNL_LIBRARY_TYPE=STATIC
       -DDNNL_DPCPP_HOST_COMPILER=${DNNL_HOST_COMPILER} # Use global cxx compiler as host compiler
       -G ${CMAKE_GENERATOR} # Align Generator to Torch
+    )
+    if(CMAKE_CXX_COMPILER_LAUNCHER)
+      list(APPEND _xpu_mkldnn_ep_cmake_args
+        "-DCMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER}")
+      if(CMAKE_C_COMPILER_LAUNCHER)
+        list(APPEND _xpu_mkldnn_ep_cmake_args
+          "-DCMAKE_C_COMPILER_LAUNCHER=${CMAKE_C_COMPILER_LAUNCHER}")
+      else()
+        list(APPEND _xpu_mkldnn_ep_cmake_args
+          "-DCMAKE_C_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER}")
+      endif()
+    endif()
+    ExternalProject_Add(xpu_mkldnn_proj
+      GIT_REPOSITORY https://github.com/uxlfoundation/oneDNN
+      GIT_TAG v3.10.2
+      PREFIX ${XPU_MKLDNN_DIR_PREFIX}
+      BUILD_IN_SOURCE 0
+      CMAKE_ARGS ${_xpu_mkldnn_ep_cmake_args}
       BUILD_COMMAND ${DNNL_MAKE_COMMAND}
       BUILD_BYPRODUCTS "xpu_mkldnn_proj-prefix/src/xpu_mkldnn_proj-build/src/${DNNL_LIB_NAME}"
       INSTALL_COMMAND ""

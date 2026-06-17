@@ -19,7 +19,10 @@ void THXPGraph_init(PyObject* module) {
   torch_C_m.def("_xpu_graph_pool_handle", &::at::xpu::graph_pool_handle);
 
   shared_ptr_class_<::at::xpu::XPUGraph>(torch_C_m, "_XPUGraph")
-      .def(py::init<bool>(), py::arg("keep_graph") = false)
+      .def(
+          py::init<bool, bool>(),
+          py::arg("keep_graph") = false,
+          py::arg("native_recording") = false)
       .def(
           "capture_begin",
           [](::at::xpu::XPUGraph& self,

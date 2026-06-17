@@ -26,6 +26,9 @@ enum class GraphCaptureMode : int8_t {
 struct TORCH_API GraphImplArgs {
   // Whether to keep the underlying raw graph after capture is complete.
   bool keep_graph = false;
+  // XPU: use SYCL ext::oneapi::experimental::property::graph::enable_native_recording
+  // when constructing the modifiable command_graph (Level Zero native graph capture).
+  bool native_recording = false;
 };
 
 // A lightweight, backend-agnostic interface that provides a unified API for

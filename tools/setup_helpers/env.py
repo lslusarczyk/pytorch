@@ -19,7 +19,9 @@ IS_LINUX = platform.system() == "Linux"
 
 IS_64BIT = struct.calcsize("P") == 8
 
-BUILD_DIR = "build"
+# Override with PYTORCH_BUILD_DIR to keep separate CMake trees per configuration
+# (e.g. build-release vs build-relwithdebinfo-xpu).
+BUILD_DIR = os.environ.get("PYTORCH_BUILD_DIR", "build")
 
 
 def check_env_flag(name: str, default: str = "") -> bool:

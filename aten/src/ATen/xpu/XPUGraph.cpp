@@ -1,10 +1,23 @@
 #include <ATen/Functions.h>
 #include <ATen/core/CachingHostAllocator.h>
-#include <ATen/xpu/XPUGeneratorImpl.h>
 #include <ATen/xpu/XPUGraph.h>
 #include <c10/xpu/XPUFunctions.h>
 
+// Graph property enable_native_recording: see LLVM SYCL
+// sycl/ext/oneapi/experimental/detail/properties/graph_properties.def
+#include <sycl/ext/oneapi/experimental/graph.hpp>
+
 #include <cstddef>
+
+// SYCL_COMPILER_VERSION: all XPU TUs (including GCC host) via FindSYCLToolkit / add_definitions.
+// Threshold is fixed here (not CMake-configurable). Unparseable compilers may use 99999999, which
+// still satisfies >= for any realistic threshold. Bump when Intel ships native graph recording.
+#define TORCH_XPU_NATIVE_GRAPH_MIN_SYCL_COMPILER_VERSION 20260101
+#if SYCL_COMPILER_VERSION >= TORCH_XPU_NATIVE_GRAPH_MIN_SYCL_COMPILER_VERSION
+#define TORCH_XPU_SYCL_NATIVE_GRAPH_RECORDING 1
+#else
+#define TORCH_XPU_SYCL_NATIVE_GRAPH_RECORDING 0
+#endif
 
 namespace at::xpu {
 
@@ -16,23 +29,44 @@ MempoolId_t graph_pool_handle() {
   return c10::xpu::MemPool::graph_pool_handle();
 }
 
-XPUGraph::XPUGraph(bool keep_graph)
+XPUGraphImpl::XPUGraphImpl(const GraphImplArgs& args)
     : capture_stream_(at::xpu::getCurrentXPUStream()),
-      keep_graph_(keep_graph) {}
+      keep_graph_(args.keep_graph),
+      native_recording_(args.native_recording) {}
 
-void XPUGraph::register_generator_state(
+void XPUGraphImpl::register_generator_state(
     c10::intrusive_ptr<at::XPUGeneratorState> state) {
   captured_generator_states_[std::move(state)] = 0;
 }
 
-void XPUGraph::register_generator_state(const at::Generator& generator) {
+void XPUGraphImpl::register_generator_state(const at::Generator& generator) {
   c10::intrusive_ptr<XPUGeneratorImpl> xpu_gen =
       dynamic_intrusive_pointer_cast<XPUGeneratorImpl>(
           generator.getIntrusivePtr());
   xpu_gen->register_graph(this);
 }
 
-void XPUGraph::capture_begin(MempoolId_t pool) {
+void XPUGraphImpl::capture_begin(
+    MempoolId_t pool /*={0,0}*/,
+    GraphCaptureMode capture_mode) {
+  switch (capture_mode) {
+    case GraphCaptureMode::Default:
+      break;
+
+    case GraphCaptureMode::Global:
+    case GraphCaptureMode::ThreadLocal:
+    case GraphCaptureMode::Relaxed:
+      TORCH_WARN(
+          "XPUGraph currently only support default GraphCaptureMode. "
+          "Falling back to default capture behavior.");
+      break;
+
+    default:
+      TORCH_CHECK(
+          false,
+          "Invalid GraphCaptureMode value: ",
+          static_cast<int>(capture_mode));
+  }
   TORCH_CHECK(
       !has_graph_exec_,
       "This XPUGraph instance already owns a captured graph. "
@@ -82,15 +116,32 @@ void XPUGraph::capture_begin(MempoolId_t pool) {
         return filter(XPUStream(XPUStream::UNCHECKED, stream));
       });
 
-  auto graph_impl = xpuGraph_t(capture_stream_.queue());
-  graph_ = std::make_unique<xpuGraph_t>(std::move(graph_impl));
+#if TORCH_XPU_SYCL_NATIVE_GRAPH_RECORDING
+  const sycl::property_list graph_props = native_recording_
+      ? sycl::property_list{property::graph::enable_native_recording{}}
+      : sycl::property_list{};
+#else
+  if (native_recording_) {
+    TORCH_WARN_ONCE(
+        "torch.xpu.XPUGraph(native_recording=True): native recording requires "
+        "SYCL_COMPILER_VERSION (from FindSYCLToolkit) >= ",
+        TORCH_XPU_NATIVE_GRAPH_MIN_SYCL_COMPILER_VERSION,
+        "; this build has ",
+        SYCL_COMPILER_VERSION,
+        ". Use a newer Intel oneAPI / SYCL toolchain (or a SYCL_ROOT whose compiler reports a "
+        "high enough version).");
+  }
+  const sycl::property_list graph_props{};
+#endif
+  graph_ = std::make_unique<xpuGraph_t>(
+      xpuGraph_t(capture_stream_.queue(), graph_props));
   graph_->begin_recording(capture_stream_.queue());
 
   TORCH_INTERNAL_ASSERT(
       capture_stream_.queue().ext_oneapi_get_state() == queue_state::recording);
 }
 
-void XPUGraph::capture_end() {
+void XPUGraphImpl::capture_end() {
   auto stream = at::xpu::getCurrentXPUStream();
 
   TORCH_CHECK(
@@ -107,8 +158,14 @@ void XPUGraph::capture_end() {
     wholegraph_increments = generator_state->capture_epilogue();
   }
 
-  size_t num_xpu_graph_nodes = graph_->get_nodes().size();
-  if (num_xpu_graph_nodes == 0) {
+  // When SYCL_COMPILER_VERSION meets the threshold, use empty(); native graphs must not use
+  // get_nodes(). Otherwise use get_nodes() for the empty check.
+#if TORCH_XPU_SYCL_NATIVE_GRAPH_RECORDING
+  const bool graph_is_empty = graph_->empty();
+#else
+  const bool graph_is_empty = (graph_->get_nodes().size() == 0);
+#endif
+  if (graph_is_empty) {
     TORCH_WARN(
         "The XPU Graph is empty. This usually means that the graph was ",
         "attempted to be captured on wrong device or stream.");
@@ -125,7 +182,7 @@ void XPUGraph::capture_end() {
   }
 }
 
-void XPUGraph::instantiate() {
+void XPUGraphImpl::instantiate() {
   TORCH_CHECK(
       capture_ended_,
       "capture_end() must have been called before calling instantiate");
@@ -141,7 +198,7 @@ void XPUGraph::instantiate() {
   has_graph_exec_ = true;
 }
 
-void XPUGraph::replay() {
+void XPUGraphImpl::replay() {
   TORCH_CHECK(
       capture_ended_,
       "Called XPUGraph::replay without a preceding successful capture.");
@@ -164,7 +221,7 @@ void XPUGraph::replay() {
   queue.ext_oneapi_graph(*graph_exec_);
 }
 
-void XPUGraph::reset() {
+void XPUGraphImpl::reset() {
   if (capture_ended_) {
     c10::xpu::XPUCachingAllocator::releasePool(capture_dev_, mempool_id_);
     at::getHostAllocator(at::kXPU)->release_pool(mempool_id_);
@@ -180,11 +237,11 @@ void XPUGraph::reset() {
   }
 }
 
-void XPUGraph::enable_debug_mode() {
+void XPUGraphImpl::enable_debug_mode() {
   _xpu_graphs_debug = true;
 }
 
-void XPUGraph::debug_dump(const std::string& debug_path) {
+void XPUGraphImpl::debug_dump(const std::string& debug_path) {
   TORCH_CHECK(
       debug_path.size() >= 4 &&
           debug_path.substr(debug_path.size() - 4) == ".dot",
@@ -207,7 +264,7 @@ void XPUGraph::debug_dump(const std::string& debug_path) {
   }
 }
 
-xpuGraph_t* XPUGraph::raw_xpu_graph() {
+xpuGraph_t* XPUGraphImpl::raw_xpu_graph() {
   TORCH_CHECK(
       keep_graph_,
       "You cannot access the raw xpuGraph_t instance unless XPUGraph was initialized with keep_graph=true");
@@ -217,7 +274,7 @@ xpuGraph_t* XPUGraph::raw_xpu_graph() {
   return graph_.get();
 }
 
-xpuGraphExec_t* XPUGraph::raw_xpu_graph_exec() {
+xpuGraphExec_t* XPUGraphImpl::raw_xpu_graph_exec() {
   TORCH_CHECK(
       has_graph_exec_,
       "You cannot access the raw xpuGraphExec_t instance until instantiate() has been called");
@@ -226,19 +283,21 @@ xpuGraphExec_t* XPUGraph::raw_xpu_graph_exec() {
 
 // Returns an id another graph's capture_begin can use to share the same memory
 // pool as this graph.
-MempoolId_t XPUGraph::pool() {
+MempoolId_t XPUGraphImpl::pool() const {
   TORCH_CHECK(
       capture_ended_,
       "Called XPUGraph::pool() without a preceding successful capture.");
   return mempool_id_;
 }
 
-XPUGraph::~XPUGraph() {
+XPUGraphImpl::~XPUGraphImpl() {
   for (auto& [generator_state, wholegraph_increments] :
        captured_generator_states_) {
     generator_state->unregister_graph(this);
   }
   reset();
 }
+
+REGISTER_GRAPH_IMPL(XPU, XPUGraphImpl)
 
 } // namespace at::xpu

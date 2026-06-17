@@ -78,7 +78,7 @@ from .triton_utils import config_of, should_unwrap_unspec_arg, signature_to_meta
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import Iterable, Iterator, Sequence
 
     import triton
 
@@ -1219,6 +1219,20 @@ class UnbackedSymbolDefsLine(WrapperLine):
         return converter._generate_unbacked_symbol_defs
 
 
+@dataclasses.dataclass
+class AssertSizeStrideLine(WrapperLine):
+    name: str
+    size: str
+    stride: str
+
+    def codegen(self, code: IndentedBuffer) -> None:
+        code.writeline(f"assert_size_stride({self.name}, {self.size}, {self.stride})")
+
+    @staticmethod
+    def codegen_fx(converter: FxConverter) -> FxConversionFunc:
+        return converter._generate_assert_size_stride
+
+
 BufferName = str
 Line = MemoryPlanningLine | LineContext
 
@@ -1232,6 +1246,8 @@ class PythonWrapperCodegen(CodeGen):
 
     def __init__(self):
         super().__init__()
+        self._pending_input_asserts: dict[str, tuple[str, str]] = {}
+        self._pending_alignment_copies: OrderedSet[str] = OrderedSet()
         self._names_iter: Iterator[int] = count()
         self.args_to_buffers: dict[
             str, None | ir.TensorBox | ir.Buffer | ir.TorchBindObject
@@ -1579,14 +1595,13 @@ class PythonWrapperCodegen(CodeGen):
                 continue
             size = self.codegen_python_shape_tuple(buf.get_size())
             stride = self.codegen_python_shape_tuple(buf.get_stride())
-            self.prefix.writeline(f"assert_size_stride({name}, {size}, {stride})")
+            self._pending_input_asserts[name] = (size, stride)
 
     def codegen_input_nan_asserts(self) -> None:
         self.prefix.writeline("# make sure graph inputs are not nan/inf")
         for name, buf in self.get_graph_inputs().items():
             if isinstance(buf, (sympy.Expr, ir.TorchBindObject)):
                 continue
-
             line = f"assert not {name}.isnan().any().item()"
             self.prefix.writeline(line)
             line = f"assert not {name}.isinf().any().item()"
@@ -1671,6 +1686,47 @@ class PythonWrapperCodegen(CodeGen):
             self.codegen_input_size_asserts()
         if config.nan_asserts:
             self.codegen_input_nan_asserts()
+
+    # Input size/stride assertions are deferred from the top of call() to just
+    # before the first kernel that uses each input. This avoids a block of N
+    # sequential assert calls (~1 us each) on the critical path before the first
+    # GPU kernel launch. Called from the scheduler codegen loop.
+    def codegen_deferred_input_asserts(self, input_names: Iterable[str]) -> None:
+        for name in input_names:
+            if name in self._pending_input_asserts:
+                size, stride = self._pending_input_asserts.pop(name)
+                self.writeline(AssertSizeStrideLine(name, size, stride))
+
+    def register_alignment_check_inputs(self) -> None:
+        """Populate pending alignment copies for non-mutated inputs.
+        Called from the scheduler after mutated_input_idxs is computed."""
+        if V.graph.cpp_wrapper:
+            return
+        inputs_to_check = V.graph.inputs_to_check
+        if not inputs_to_check:
+            return
+        # Mutated inputs are handled separately by the runtime wrapper,
+        # which needs to copy back the mutation after the call.
+        mutated_idxs = OrderedSet(V.graph.mutated_input_idxs)
+        for idx in inputs_to_check:
+            if idx not in mutated_idxs:
+                name = V.graph.graph_input_names[idx]
+                self._pending_alignment_copies.add(name)
+        if self._pending_alignment_copies:
+            V.graph._defers_input_alignment = True
+            self.imports.writeline(
+                "from torch._C._dynamo.guards import copy_misaligned"
+            )
+
+    def codegen_deferred_alignment_copies(self, input_names: Iterable[str]) -> None:
+        """Emit alignment check + clone just before the first kernel
+        that reads each input, hiding the cost behind GPU execution."""
+        if V.graph.cpp_wrapper:
+            return
+        for name in input_names:
+            if name in self._pending_alignment_copies:
+                self._pending_alignment_copies.discard(name)
+                self.writeline(f"{name} = copy_misaligned({name})")
 
     # this function (and below) takes the graph name as input so
     # that stream caching happens per graph instance. this
@@ -3234,7 +3290,7 @@ class PythonWrapperCodegen(CodeGen):
         current_stream_idx=None,
     ):
         device = device or V.graph.get_current_device_or_throw()
-        if not triton and device.type != "cuda":
+        if not triton and device.type not in ("cuda", "xpu"):
             if device.type == "cpu":
                 self.writeline(self.wrap_kernel_call(kernel_name, call_args))
             elif device.type == "mps":
@@ -3343,7 +3399,7 @@ class PythonWrapperCodegen(CodeGen):
 
             reused_args = {}
             for i, (arg, arg_type, raw_key, raw_arg) in enumerate(
-                # pyrefly: ignore [no-matching-overload]
+                # pyrefly: ignore [bad-argument-type, no-matching-overload]
                 zip(call_args, arg_types, raw_keys, raw_args)
             ):
                 key = None

@@ -1603,10 +1603,17 @@ class SchedulerNode(BaseSchedulerNode):
         extra_indexing_constraints: tuple[dict[Any, Any], list[Any]] | None = None,
         recompute_sizes_body_func: Callable[..., Any] | None = None,
     ) -> None:
+        fake_deps: OrderedSet[Dep] = OrderedSet(
+            dep for dep in self.read_writes.reads if isinstance(dep, (WeakDep, StarDep))
+        )
         self._compute_attrs(
             extra_indexing_constraints=extra_indexing_constraints,
             recompute_sizes_body_func=recompute_sizes_body_func,
         )
+        if fake_deps:
+            self.set_read_writes(
+                self.read_writes.with_read(fake_deps).rename(self.mutation_renames)
+            )
 
     def refresh_dependencies(
         self, normalize: bool, need_clear_tiling_cache: bool
@@ -7499,6 +7506,10 @@ class Scheduler:
         if self.default_device_context and config.triton.autotune_at_compile_time:
             V.graph.wrapper_code.write_get_raw_stream_header()
 
+        # Register non-mutated inputs that need alignment checks.
+        # Deferred to just before the first kernel that reads each input.
+        V.graph.wrapper_code.register_alignment_check_inputs()
+
         for node in nodes:
             if log.isEnabledFor(logging.DEBUG):
                 try:
@@ -7514,6 +7525,12 @@ class Scheduler:
                     )
 
             self.enter_context(node)
+
+            # pyrefly: ignore [unbound-name]
+            if config.size_asserts:
+                V.graph.wrapper_code.codegen_deferred_input_asserts(
+                    dep.name for dep in node.read_writes.reads
+                )
 
             if device := node.get_device():
                 if (
@@ -7555,6 +7572,15 @@ class Scheduler:
             if self._has_multi_stream_nodes() and self.current_device is not None:
                 self.generate_stream_ctx_switching(node)
 
+            # Emit deferred alignment copies for inputs first used by this
+            # node.  This runs *after* stream context switching so the copy
+            # executes on the same stream as the consuming kernel.
+            # TODO: inputs read on multiple streams should be copied in the
+            # prologue instead, to avoid cross-stream races.
+            V.graph.wrapper_code.codegen_deferred_alignment_copies(
+                dep.name for dep in node.read_writes.reads
+            )
+
             self.current_node = node
             self.buffer_names_to_free.update(node.last_usage)
 
@@ -7574,8 +7600,12 @@ class Scheduler:
                 backend_ = self.get_backend(device)
                 from .codegen.cuda_combined_scheduling import CUDACombinedScheduling
                 from .codegen.simd import SIMDScheduling
+                from .codegen.xpu.xpu_combined_scheduling import XPUCombinedScheduling
 
-                if isinstance(backend_, (SIMDScheduling, CUDACombinedScheduling)):
+                if isinstance(
+                    backend_,
+                    (SIMDScheduling, CUDACombinedScheduling, XPUCombinedScheduling),
+                ):
                     backend = backend_
                 else:
                     raise AssertionError(f"{type(self)=}")
